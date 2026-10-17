@@ -2686,17 +2686,17 @@ pub struct AutoPhraseConfig {
     /// （`docs/design/auto-phrase-draft-layer.md`）。内部字段，设置页不开放。
     #[serde(default = "default_draft_ttl_hours")]
     pub draft_ttl_hours: u32,
-    /// **草稿层**条目上限（0=不限）。超出后按 `created_at` 升序淘汰（最早的先走，
-    /// 而写入会刷新它，故实际是近似 LRU）。内部字段，设置页不开放。
+    /// **草稿层**条目上限（0=不限）。超出后按 `last_used` 升序淘汰（最早的先走；
+    /// 写入会刷新它，故实际是近似 LRU）。内部字段，设置页不开放。
     ///
     /// ⚠️ 默认值来自设计稿 §7 的**纸面估算上界**（滑窗约每字 4 条，一天 8 小时约 11.5 万条），
     /// 真实打字有大量停顿与重复窗口应显著更低——**这不是实测值**，待真机数据出来后重定。
     #[serde(default = "default_draft_max_entries")]
     pub draft_max_entries: usize,
-    /// **草稿层**攒够多少条触发一次后台落库。默认 64。
+    /// **草稿层**单次批量写最多落库多少条草稿。默认 64。
     ///
-    /// 太小则频繁抢 redb 的单写锁（草稿是这个库里最高频的写入方），太大则一批的取码与
-    /// 查重堆在一起、且崩溃时丢得更多。内部字段，设置页不开放。**待实测调参。**
+    /// 太小则同一批词要多开几次批量写，太大则一批的取码与查重堆在一起、且崩溃时丢得更多。
+    /// 内部字段，设置页不开放。**待实测调参。**
     #[serde(default = "default_draft_flush_batch")]
     pub draft_flush_batch: usize,
 }

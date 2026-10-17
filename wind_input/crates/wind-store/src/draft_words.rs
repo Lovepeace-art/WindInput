@@ -1,4 +1,4 @@
-//! 自动造词的草稿层（redb `DRAFT_WORDS` 表）
+//! 自动造词的草稿层（运行时引擎门面；真源是 `data/<schema>/draft.dict.yaml`）
 //!
 //! 滑窗切出的候选词先落这里，用户真的用它上屏过一次才跃迁进临时词库
 //! （[`Store::promote_draft_to_temp`]）。设计见 `docs/design/auto-phrase-draft-layer.md`。
@@ -11,9 +11,10 @@
 //!
 //! # 时间语义
 //!
-//! `created_at` 既是有效期的起点，也是容量淘汰的排序键，还承担「续期」：
-//! 同一条草稿被再次写入时**刷新**它（见 [`Store::add_drafts`]）。于是容量淘汰
-//! 「按 created_at 升序」实际上是近似 LRU——反复打的词自然排到后面。
+//! 引擎侧只持久化一个时间列 `last_used`（文本表 `text, code, last_used` 也只有它），
+//! 它既是有效期的起点，也是容量淘汰的排序键，还承担「续期」：同一条草稿被再次写入时
+//! **刷新**它（见 [`Store::add_drafts`]）。于是容量淘汰「按 `last_used` 升序」实际上是
+//! 近似 LRU——反复打的词自然排到后面。
 //!
 //! ⚠️ 本层的过期判定**必须在查询时做**（[`Store::search_drafts`] 带 `ttl_secs`），
 //! 不能只靠 [`Store::purge_expired_drafts`] 定期清理：清理线程没跑到的窗口里，
@@ -31,13 +32,12 @@ pub(crate) fn dec_draft(b: &[u8]) -> Option<i64> {
 }
 
 impl Store {
-    /// 批量写入草稿（**单写事务**）。已存在的条目**刷新 `created_at`**（续期，见模块文档）。
+    /// 批量写入草稿（一次批量写）。已存在的条目**刷新 `last_used`**（续期，见模块文档）。
     ///
-    /// 批量是刚性要求而非优化：redb 是单写者，草稿的产生速率（滑窗下约每字 4 条）
-    /// 远高于这个库里的其它写入方，逐条开事务会顶到选词写词频（`record_freq`）那条路上。
-    /// 调用方负责攒批，本函数只保证「这一批共用一个事务」。
+    /// 调用方负责攒批：草稿的产生速率（滑窗下约每字 4 条）远高于本库其余写入方，
+    /// 逐条写会频繁触发引擎落盘与文本折回。
     ///
-    /// 返回实际写入条数（= `items.len()`，失败整批回滚）。
+    /// 返回实际写入条数（= `items.len()`）。
     pub fn add_drafts(&self, schema: &str, items: &[(String, String)]) -> anyhow::Result<usize> {
         let n = self.runtime().add_drafts(schema, items)?;
         self.after_write();
@@ -63,7 +63,7 @@ impl Store {
         self.runtime().has_draft(schema, code, text, ttl_secs)
     }
 
-    /// 清理过期草稿（单写事务）。返回删除条数。`ttl_secs == 0` 时什么都不做。
+    /// 清理过期草稿（引擎侧批量删）。返回删除条数。`ttl_secs == 0` 时什么都不做。
     ///
     /// 这是**容量维护**，不是过期语义——过期判定在 [`Self::search_drafts`] 里，
     /// 少跑一次清理只会让表大一点，不会让过期草稿被召回。
@@ -90,10 +90,10 @@ impl Store {
         self.runtime().purge_expired_drafts(None, ttl_secs)
     }
 
-    /// 容量淘汰：保留 `max_keep` 条，按 `created_at` **升序**淘汰（最早的先走）。返回淘汰条数。
+    /// 容量淘汰：保留 `max_keep` 条，按 `last_used` **升序**淘汰（最早的先走）。返回淘汰条数。
     ///
-    /// 排序键只有 `created_at`，因为草稿没有 count 可比——它一旦被用过就不再是草稿了
-    /// （跃迁进临时词库，见 [`Self::promote_draft_to_temp`]）。而写入时会刷新 `created_at`
+    /// 排序键只有 `last_used`，因为草稿没有 count 可比——它一旦被用过就不再是草稿了
+    /// （跃迁进临时词库，见 [`Self::promote_draft_to_temp`]）。而写入时会刷新 `last_used`
     /// （续期），所以这条升序实际上是近似 LRU，不是纯 FIFO。
     pub fn evict_drafts(&self, schema: &str, max_keep: usize) -> anyhow::Result<usize> {
         self.runtime().evict_drafts(schema, max_keep)
