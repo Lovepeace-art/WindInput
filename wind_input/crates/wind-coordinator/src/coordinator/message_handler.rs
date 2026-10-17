@@ -2071,6 +2071,9 @@ impl MessageHandler for Coordinator {
                                 let buf = state.input_buffer.clone();
                                 (CandidateSource::default(), buf, text.clone())
                             });
+                        // `6a-draft`：满码自动上屏 / 空码顶出同样算「用过」→ 草稿转正。
+                        // 与 `coordinator.rs` 那处 AutoCommit 同口径，判据见 `commit_top_text`。
+                        self.promote_draft_on_auto_commit(&state, &text, &code);
                         let out = self
                             .commit_candidate(&mut state, &text, &freq_text, None, source, &code);
                         // 满码自动上屏同样要接联想（t185），出口与手动选词一致。

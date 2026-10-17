@@ -4229,6 +4229,10 @@ impl Coordinator {
     ///
     /// `freq_text`：词频记账文本（被顶出候选的 [`Candidate::freq_text`]；`None` = 同
     /// `top_text`）。模板词的 `top_text` 是当天展开结果，按它记账次日即成孤儿行（GH#177）。
+    ///
+    /// `draft_boundary`：顶出的首选**是一条草稿候选**时它的 `boundary`，否则 `None`。
+    /// 非 `None` 表示这次上屏要按「草稿被用过」记账（跃迁进临时词库）——判据是**词落了屏**，
+    /// 不是用户按了哪颗键：顶码本来就没有选择键可按。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_top_text(
         &self,
@@ -4239,6 +4243,7 @@ impl Coordinator {
         s2t_override: Option<&str>,
         remainder: &str,
         source: CandidateSource,
+        draft_boundary: Option<u64>,
     ) -> KeyAction {
         if !top_text.is_empty() {
             self.record_selection_cased_in(
@@ -4255,6 +4260,12 @@ impl Coordinator {
                 0,
                 wind_store::stats::CommitSource::Candidate,
             );
+            // `6a-draft`：顶码上屏同样算「用过」→ 草稿跃迁进临时词库。
+            // 判据是词落没落屏，不是「用户按了哪颗键」——顶码没有选择键可按，但词确实上了屏；
+            // 缺了这一跳，打超满码长顶出草稿的人永远打不出自己造的词。
+            if let Some(boundary) = draft_boundary {
+                let _ = self.promote_draft_on_commit(prefix, &top_text, boundary);
+            }
         }
         // 出屏文本（记账之后取，见上）：变体候选用其覆盖文本，其余按需简繁转换。
         let out_text = match s2t_override {
