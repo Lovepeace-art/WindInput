@@ -431,4 +431,111 @@ mod tests {
         assert_eq!(s.count_drafts("wb").unwrap(), 0);
         let _ = std::fs::remove_file(&p);
     }
+
+    /// 新草稿机制（P5 文本真源）端到端：`draft.dict.yaml` 里记的是**首次入库时间**，
+    /// 折回、重开（按文本重建）之后仍然不续期、仍然是纯 FIFO。
+    ///
+    /// 这条刻意走 `Store` 门面 + 真实文本文件，而不是只测 `Runtime`：文本折回会丢掉
+    /// `created_at`（`DRAFT` 表只有 `text/code/last_used` 三列），实现若哪天又改用
+    /// `created_at` 判年龄，这里会直接红。
+    #[test]
+    fn draft_text_truth_keeps_first_seen_time_across_fold_and_reopen() {
+        let p = tmp("wind_draft_text_truth.redb");
+        let _ = std::fs::remove_dir_all(crate::store::derived_state_dir(&p));
+        let _ = std::fs::remove_dir_all(crate::store::derived_text_dir(&p));
+        let now = now_secs();
+        let day = 86_400;
+        let text_path = crate::store::derived_text_dir(&p).join("wb/draft.dict.yaml");
+
+        {
+            let s = Store::open(&p).unwrap();
+            drafts_at(
+                &s,
+                &[
+                    ("wb", "aaaa", "最老", now - 300),
+                    ("wb", "bbbb", "中间", now - 200),
+                    ("wb", "cccc", "最新", now - 100),
+                ],
+            );
+            // 未过期 ⇒ 再写一次被跳过（不续期）
+            assert_eq!(
+                s.add_drafts("wb", &items(&[("aaaa", "最老")]), day)
+                    .unwrap(),
+                0
+            );
+            s.flush_user_data().unwrap();
+            let text = std::fs::read_to_string(&text_path).unwrap();
+            assert!(
+                text.contains(&format!("最老\taaaa\t{}", now - 300)),
+                "文本里该是首次入库时间（{}），实际:\n{text}",
+                now - 300
+            );
+            // 纯 FIFO：最老的那条先走，且淘汰结果立刻折回文本
+            assert_eq!(s.evict_drafts("wb", 2).unwrap(), 1);
+            s.flush_user_data().unwrap();
+            let text = std::fs::read_to_string(&text_path).unwrap();
+            assert!(!text.contains("最老"), "淘汰结果应已写回文本:\n{text}");
+        }
+
+        // 模拟换机 / 状态目录丢失：只留文本，打开时按文本重建。
+        std::fs::remove_dir_all(crate::store::derived_state_dir(&p)).unwrap();
+        let s = Store::open(&p).unwrap();
+        assert_eq!(s.search_drafts("wb", "bbbb", day).unwrap(), vec!["中间"]);
+        assert_eq!(s.search_drafts("wb", "cccc", day).unwrap(), vec!["最新"]);
+        assert!(
+            s.search_drafts("wb", "aaaa", day).unwrap().is_empty(),
+            "已淘汰的草稿不该从文本里复活"
+        );
+        // 重建之后仍不续期
+        assert_eq!(
+            s.add_drafts("wb", &items(&[("bbbb", "中间")]), day)
+                .unwrap(),
+            0
+        );
+        drop(s);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(crate::store::derived_state_dir(&p));
+        let _ = std::fs::remove_dir_all(crate::store::derived_text_dir(&p));
+    }
+
+    /// 过期草稿重新打出 = 新草稿：文本里的时间戳被换掉，重开之后按新时间算年龄。
+    #[test]
+    fn an_expired_draft_gets_a_fresh_timestamp_in_the_text_file() {
+        let p = tmp("wind_draft_text_expired.redb");
+        let _ = std::fs::remove_dir_all(crate::store::derived_state_dir(&p));
+        let _ = std::fs::remove_dir_all(crate::store::derived_text_dir(&p));
+        let text_path = crate::store::derived_text_dir(&p).join("wb/draft.dict.yaml");
+        let now = now_secs();
+        let day = 86_400;
+        let stale = now - 2 * day;
+        {
+            let s = Store::open(&p).unwrap();
+            drafts_at(&s, &[("wb", "aaaa", "隔天的", stale)]);
+            s.flush_user_data().unwrap();
+            let text = std::fs::read_to_string(&text_path).unwrap();
+            assert!(text.contains(&format!("隔天的\taaaa\t{stale}")), "{text}");
+
+            // 过期 ⇒ 不该被当成「已存在」，这次真的落库并换上新时间戳
+            assert_eq!(
+                s.add_drafts("wb", &items(&[("aaaa", "隔天的")]), day)
+                    .unwrap(),
+                1,
+                "过期的旧记录等同于不存在，这次该真的落库"
+            );
+            s.flush_user_data().unwrap();
+            let text = std::fs::read_to_string(&text_path).unwrap();
+            assert!(
+                !text.contains(&format!("\taaaa\t{stale}")),
+                "旧时间戳应被换掉:\n{text}"
+            );
+        }
+        // 只留文本重开：新时间戳在文本里，重开后该能召回（不被当成过期）
+        std::fs::remove_dir_all(crate::store::derived_state_dir(&p)).unwrap();
+        let s = Store::open(&p).unwrap();
+        assert_eq!(s.search_drafts("wb", "aaaa", day).unwrap(), vec!["隔天的"]);
+        drop(s);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(crate::store::derived_state_dir(&p));
+        let _ = std::fs::remove_dir_all(crate::store::derived_text_dir(&p));
+    }
 }
