@@ -5920,6 +5920,7 @@ impl Coordinator {
                                 None,
                                 &remainder,
                                 cand.source,
+                                None, // 命令文本不是候选实体，无从是草稿
                             ),
                             None => self.top_commit_command_with_remainder(
                                 state, &cand, &prefix, &remainder,
@@ -5931,6 +5932,8 @@ impl Coordinator {
                         let source = cand.source;
                         let s2t_override = cand.s2t_override.clone();
                         let freq_text = cand.freq_text().to_string();
+                        // 顶出的首选就是一条草稿候选 ⇒ 这次上屏要按「用过」转正。
+                        let draft_boundary = cand.is_draft.then_some(cand.boundary);
                         return self.commit_top_text(
                             state,
                             &prefix,
@@ -5939,6 +5942,7 @@ impl Coordinator {
                             s2t_override.as_deref(),
                             &remainder,
                             source,
+                            draft_boundary,
                         );
                     }
                     // 显示首选是拼音/英文 → 放弃顶码，落到下方正常候选刷新继续组合。
@@ -5955,6 +5959,7 @@ impl Coordinator {
                     None, // 引擎码表纯文本，无候选对象可承载变体覆盖
                     &remainder,
                     CandidateSource::CodeTable,
+                    None, // 同上：纯文本没有候选实体，无从是草稿
                 );
             }
         }
@@ -5976,6 +5981,10 @@ impl Coordinator {
                         let buf = state.input_buffer.clone();
                         (CandidateSource::default(), buf, text.clone())
                     });
+                // `6a-draft`：满码自动上屏 / 空码顶出也是「词落了屏」，草稿候选同样算用过。
+                // 判据与顶码一致（见 `commit_top_text`）：算数的不是用户按了哪颗键，而是词有
+                // 没有真上屏——开着 `auto_commit_at_full` 时候选栏根本没机会让人按选择键。
+                self.promote_draft_on_auto_commit(state, &text, &code);
                 let out = self.commit_candidate(state, &text, &freq_text, None, source, &code);
                 // 满码自动上屏同样要接联想（t185），出口与手动选词一致。
                 return self.auto_commit_then_assoc(state, out, &text);

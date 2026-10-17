@@ -628,7 +628,7 @@ mod tests {
         assert_eq!(got[0].map(|r| r.count), Some(1));
         s.record_assoc_pick("py", "天", "气").unwrap();
         assert_eq!(s.assoc_history("py", "天", 0).unwrap().len(), 1);
-        s.add_drafts("wb", &[("ggtt".into(), "盖伦".into())])
+        s.add_drafts("wb", &[("ggtt".into(), "盖伦".into())], 0)
             .unwrap();
         assert_eq!(s.search_drafts("wb", "ggtt", 86_400).unwrap(), vec!["盖伦"]);
         use wind_dict::DictLayer;

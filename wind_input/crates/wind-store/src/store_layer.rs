@@ -207,7 +207,7 @@ mod tests {
         s.add_user_word("wb", "ac", "乙", 20, 0).unwrap();
         s.add_user_word("wb", "abcd", "丙", 99, 0).unwrap();
         s.learn_temp_word("wb", "bb", "丁", 30, 0).unwrap();
-        s.add_drafts("wb", &[("ad".to_string(), "草".to_string())])
+        s.add_drafts("wb", &[("ad".to_string(), "草".to_string())], 0)
             .unwrap();
         let slot = wind_dict::layer::WILDCARD_SLOT;
         let p = format!("a{slot}");
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn drafts_never_surface_through_prefix_queries() {
         let s = store("draft_prefix");
-        s.add_drafts("wb", &[("wqvb".to_string(), "你好".to_string())])
+        s.add_drafts("wb", &[("wqvb".to_string(), "你好".to_string())], 0)
             .unwrap();
         // 同时放一条**临时词**做对照组：同样的前缀，它必须照常召回。
         // 没有这个对照，一个「前缀查询整个坏掉」的实现也能让本用例变绿。

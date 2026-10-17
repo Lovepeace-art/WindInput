@@ -920,6 +920,7 @@ mod tests {
                     None,
                     "h",
                     wind_candidate::CandidateSource::CodeTable,
+                    None,
                 )
             };
             // ↓ 这三行是 `handle_key_event_policed` 出口那一步的复述（见上面的 ⚠️）。

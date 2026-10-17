@@ -1368,7 +1368,7 @@ mod tests {
             .unwrap();
         s.learn_temp_word("pinyin", "zaijian", "再见", 1, 0b1001)
             .unwrap();
-        s.add_drafts("pinyin", &[("haode".into(), "好的".into())])
+        s.add_drafts("pinyin", &[("haode".into(), "好的".into())], 0)
             .unwrap();
         s.record_freq("pinyin", "nihao", "你好").unwrap();
         s.record_assoc_pick("pinyin", "我们", "我们的").unwrap();

@@ -1,4 +1,4 @@
-//! 自动造词的草稿层（redb `DRAFT_WORDS` 表）
+//! 自动造词的草稿层（`Runtime` 的草稿 API 门面；真源是 `data/<schema>/draft.dict.yaml`）
 //!
 //! 滑窗切出的候选词先落这里，用户真的用它上屏过一次才跃迁进临时词库
 //! （[`Store::promote_draft_to_temp`]）。设计见 `docs/design/auto-phrase-draft-layer.md`。
@@ -11,9 +11,11 @@
 //!
 //! # 时间语义
 //!
-//! `created_at` 既是有效期的起点，也是容量淘汰的排序键，还承担「续期」：
-//! 同一条草稿被再次写入时**刷新**它（见 [`Store::add_drafts`]）。于是容量淘汰
-//! 「按 created_at 升序」实际上是近似 LRU——反复打的词自然排到后面。
+//! 引擎侧只持久化一个时间列 `last_used`（文本表 `text, code, last_used` 也只有它），
+//! 而草稿**写入不续期**：同一条草稿已存在且未过期时直接跳过（见 [`Store::add_drafts`]），
+//! 于是 `last_used` 在草稿上就是**首次入库时间**。容量淘汰按它升序 ⇒ 纯 FIFO，
+//! 反复打的词不会因为「又被写了一次」而排到后面；过期条目重新打出时会被删掉重建，
+//! 拿到一个全新的有效期。
 //!
 //! ⚠️ 本层的过期判定**必须在查询时做**（[`Store::search_drafts`] 带 `ttl_secs`），
 //! 不能只靠 [`Store::purge_expired_drafts`] 定期清理：清理线程没跑到的窗口里，
@@ -31,15 +33,23 @@ pub(crate) fn dec_draft(b: &[u8]) -> Option<i64> {
 }
 
 impl Store {
-    /// 批量写入草稿（**单写事务**）。已存在的条目**刷新 `created_at`**（续期，见模块文档）。
+    /// 批量写入草稿（一次 `apply_batch` 落库）。已存在且**未过期**的条目**跳过**（不续期）；
+    /// 已过期的旧记录删掉重建，等同一条全新草稿（见模块文档「时间语义」）。
     ///
-    /// 批量是刚性要求而非优化：redb 是单写者，草稿的产生速率（滑窗下约每字 4 条）
-    /// 远高于这个库里的其它写入方，逐条开事务会顶到选词写词频（`record_freq`）那条路上。
-    /// 调用方负责攒批，本函数只保证「这一批共用一个事务」。
+    /// `ttl_secs` 就是本层的有效期配置（`auto_phrase.draft_ttl_hours * 3600`），它在这里
+    /// 回答「库里那条同 key 的记录还算不算存在」；`0` = 永不过期，已存在的一律保留。
     ///
-    /// 返回实际写入条数（= `items.len()`，失败整批回滚）。
-    pub fn add_drafts(&self, schema: &str, items: &[(String, String)]) -> anyhow::Result<usize> {
-        let n = self.runtime().add_drafts(schema, items)?;
+    /// 批量是刚性要求而非优化：草稿的产生速率（滑窗下约每字 4 条）远高于这个库里的其它
+    /// 写入方，调用方负责攒批，本函数保证「这一批共用一次批量写」。
+    ///
+    /// 返回**实际落库条数**（被跳过的已存在条目不计入）。
+    pub fn add_drafts(
+        &self,
+        schema: &str,
+        items: &[(String, String)],
+        ttl_secs: i64,
+    ) -> anyhow::Result<usize> {
+        let n = self.runtime().add_drafts(schema, items, ttl_secs)?;
         self.after_write();
         Ok(n)
     }
@@ -63,7 +73,7 @@ impl Store {
         self.runtime().has_draft(schema, code, text, ttl_secs)
     }
 
-    /// 清理过期草稿（单写事务）。返回删除条数。`ttl_secs == 0` 时什么都不做。
+    /// 清理过期草稿（引擎侧批量删）。返回删除条数。`ttl_secs == 0` 时什么都不做。
     ///
     /// 这是**容量维护**，不是过期语义——过期判定在 [`Self::search_drafts`] 里，
     /// 少跑一次清理只会让表大一点，不会让过期草稿被召回。
@@ -90,11 +100,11 @@ impl Store {
         self.runtime().purge_expired_drafts(None, ttl_secs)
     }
 
-    /// 容量淘汰：保留 `max_keep` 条，按 `created_at` **升序**淘汰（最早的先走）。返回淘汰条数。
+    /// 容量淘汰：保留 `max_keep` 条，按 `last_used` **升序**淘汰（最早的先走）。返回淘汰条数。
     ///
-    /// 排序键只有 `created_at`，因为草稿没有 count 可比——它一旦被用过就不再是草稿了
-    /// （跃迁进临时词库，见 [`Self::promote_draft_to_temp`]）。而写入时会刷新 `created_at`
-    /// （续期），所以这条升序实际上是近似 LRU，不是纯 FIFO。
+    /// 草稿上 `last_used` 是**首次入库时间**（写入不续期，见 [`Self::add_drafts`]），所以这条
+    /// 升序是纯 FIFO，不是近似 LRU。排序键只有它，因为草稿没有 count 可比——它一旦被用过
+    /// 就不再是草稿了（跃迁进临时词库，见 [`Self::promote_draft_to_temp`]）。
     pub fn evict_drafts(&self, schema: &str, max_keep: usize) -> anyhow::Result<usize> {
         self.runtime().evict_drafts(schema, max_keep)
     }
@@ -196,7 +206,7 @@ mod tests {
     fn drafts_are_found_by_exact_code_only() {
         let p = tmp("wind_draft_exact.redb");
         let s = Store::open(&p).unwrap();
-        s.add_drafts("wb", &items(&[("wqvb", "你好"), ("wqv", "你女")]))
+        s.add_drafts("wb", &items(&[("wqvb", "你好"), ("wqv", "你女")]), 0)
             .unwrap();
         assert_eq!(s.search_drafts("wb", "wqvb", 0).unwrap(), vec!["你好"]);
         assert_eq!(s.search_drafts("wb", "wqv", 0).unwrap(), vec!["你女"]);
@@ -234,13 +244,15 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// 再次写入同一条草稿要**续期**，于是容量淘汰是近似 LRU 而非纯 FIFO。
+    /// 再次写入同一条草稿**不续期**：`last_used` 永远是**首次**入库时间。
+    ///
+    /// 于是容量淘汰是纯 FIFO——最早进草稿的先走，与它被重复写过几次无关。
     #[test]
-    fn rewriting_a_draft_renews_it_so_eviction_is_lru_like() {
-        let p = tmp("wind_draft_renew.redb");
+    fn rewriting_a_draft_keeps_its_first_seen_time() {
+        let p = tmp("wind_draft_no_renew.redb");
         let s = Store::open(&p).unwrap();
         let now = now_secs();
-        // 三条，created_at 递增；其中最老的那条稍后被「再打一次」
+        // 三条，首次入库时间递增；其中最老的那条稍后被「再打一次」
         drafts_at(
             &s,
             &[
@@ -249,16 +261,56 @@ mod tests {
                 ("wb", "cccc", "最新", now - 100),
             ],
         );
-        // 「最老」被再次打出 ⇒ 续期到现在
-        s.add_drafts("wb", &items(&[("aaaa", "最老")])).unwrap();
-        // 保留 2 条 ⇒ 该淘汰的是「中间」（现在它才是 created_at 最小的）
+        // 「最老」被再次打出 ⇒ 跳过，首次入库时间不动，这次一条也没落库
+        assert_eq!(
+            s.add_drafts("wb", &items(&[("aaaa", "最老")]), 86_400)
+                .unwrap(),
+            0,
+            "已存在且未过期的草稿不该被重写"
+        );
+        // 保留 2 条 ⇒ 该淘汰的仍然是「最老」：它没有因为又被写了一次而排到后面
         assert_eq!(s.evict_drafts("wb", 2).unwrap(), 1);
         assert!(
-            !s.search_drafts("wb", "aaaa", 0).unwrap().is_empty(),
-            "续期过的草稿不该被当成最老的淘汰掉"
+            s.search_drafts("wb", "aaaa", 0).unwrap().is_empty(),
+            "没续期的草稿仍是最老的，该被淘汰"
         );
-        assert!(s.search_drafts("wb", "bbbb", 0).unwrap().is_empty());
+        assert!(!s.search_drafts("wb", "bbbb", 0).unwrap().is_empty());
         assert!(!s.search_drafts("wb", "cccc", 0).unwrap().is_empty());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 已**过期**的旧记录等同于不存在：重新打出同一个词 = 一条全新的草稿，重新获得
+    /// 一整个有效期。否则清理（机会性的，只跟在落库之后）没扫到之前，那条词再也进不了草稿。
+    #[test]
+    fn an_expired_draft_is_rewritten_as_a_brand_new_one() {
+        let p = tmp("wind_draft_expired_rewrite.redb");
+        let s = Store::open(&p).unwrap();
+        let now = now_secs();
+        let day = 86_400;
+        drafts_at(&s, &[("wb", "aaaa", "隔天的", now - 90_000)]);
+        // 过期 ⇒ 不该被当成「已存在」，本次真的落库
+        assert_eq!(
+            s.add_drafts("wb", &items(&[("aaaa", "隔天的")]), day)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.search_drafts("wb", "aaaa", day).unwrap(),
+            vec!["隔天的"],
+            "过期之后重新打出 = 新草稿，该能被召回"
+        );
+        // 这回它没过期 ⇒ 再次写入被跳过
+        assert_eq!(
+            s.add_drafts("wb", &items(&[("aaaa", "隔天的")]), day)
+                .unwrap(),
+            0
+        );
+        // ttl=0 ＝ 永不过期 ⇒ 已存在的条目一律保留，同样不重写
+        assert_eq!(
+            s.add_drafts("wb", &items(&[("aaaa", "隔天的")]), 0)
+                .unwrap(),
+            0
+        );
         let _ = std::fs::remove_file(&p);
     }
 
@@ -267,7 +319,7 @@ mod tests {
     fn promoting_a_draft_moves_it_and_maintains_the_abbrev_index() {
         let p = tmp("wind_draft_promote.redb");
         let s = Store::open(&p).unwrap();
-        s.add_drafts("py", &items(&[("nihao", "你好")])).unwrap();
+        s.add_drafts("py", &items(&[("nihao", "你好")]), 0).unwrap();
         assert!(
             s.promote_draft_to_temp("py", "nihao", "你好", 800, 0b101)
                 .unwrap()
@@ -300,7 +352,7 @@ mod tests {
         let p = tmp("wind_draft_promote_existing.redb");
         let s = Store::open(&p).unwrap();
         s.learn_temp_word("wb", "wqvb", "你好", 1234, 0).unwrap(); // 已有、权重更高
-        s.add_drafts("wb", &items(&[("wqvb", "你好")])).unwrap();
+        s.add_drafts("wb", &items(&[("wqvb", "你好")]), 0).unwrap();
         assert!(
             s.promote_draft_to_temp("wb", "wqvb", "你好", 800, 0)
                 .unwrap()
@@ -320,8 +372,10 @@ mod tests {
     fn drafts_are_isolated_per_schema() {
         let p = tmp("wind_draft_schema.redb");
         let s = Store::open(&p).unwrap();
-        s.add_drafts("wb", &items(&[("aaaa", "五笔的")])).unwrap();
-        s.add_drafts("py", &items(&[("aaaa", "拼音的")])).unwrap();
+        s.add_drafts("wb", &items(&[("aaaa", "五笔的")]), 0)
+            .unwrap();
+        s.add_drafts("py", &items(&[("aaaa", "拼音的")]), 0)
+            .unwrap();
         assert_eq!(s.search_drafts("wb", "aaaa", 0).unwrap(), vec!["五笔的"]);
         assert_eq!(s.clear_drafts("wb").unwrap(), 1);
         assert_eq!(
@@ -373,7 +427,7 @@ mod tests {
     fn empty_batch_is_a_noop() {
         let p = tmp("wind_draft_empty.redb");
         let s = Store::open(&p).unwrap();
-        assert_eq!(s.add_drafts("wb", &[]).unwrap(), 0);
+        assert_eq!(s.add_drafts("wb", &[], 0).unwrap(), 0);
         assert_eq!(s.count_drafts("wb").unwrap(), 0);
         let _ = std::fs::remove_file(&p);
     }

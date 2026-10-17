@@ -1,5 +1,13 @@
-//! 草稿（对照 `wind-store/src/draft_words.rs`）。有效期基准是 `last_used`：每次写入都是
-//! Upsert，叠加语义里 Upsert 刷新 last_used，等同 redb 版「重写即续期」。
+//! 草稿（对照 `wind-store/src/draft_words.rs`，那里只是门面）。
+//!
+//! 有效期基准是 `last_used`，但**写入不续期**：同一条 `(schema, code, text)` 已存在且未过期时
+//! [`Runtime::add_drafts`] 直接跳过，于是 `last_used` 始终是**首次入库时间**（等价旧 redb 版
+//! 只记一次的 `created_at`）。已过期的旧记录等同于不存在，删掉重建、重新获得一整个有效期。
+//! 容量淘汰按这个时间升序，因此是纯 FIFO，不是近似 LRU。
+//!
+//! 为什么只有一个时间列：草稿真源已换成 `data/<schema>/draft.dict.yaml` 表格文本，列规格
+//! （`text/codec.rs` 的 `DRAFT`）只持久化 `last_used`；`created_at` 在文本折回后会丢成 0。
+//! 把「首次入库」的语义压在唯一会落盘的时间列上，跨折回才不丢草稿年龄。
 
 use super::{Runtime, now_secs};
 use crate::engine::Op;
@@ -12,21 +20,75 @@ const D: Target = Target::Draft;
 const BULK_DELETE_MAX: usize = 1024;
 
 /// 未过期。`ttl_secs <= 0` 表示永不过期。
+///
+/// 草稿上 `last_used` 是**首次入库时间**（写入不续期，见模块文档），所以这里判的就是
+/// 「这条草稿入库多久了」。
 pub fn draft_alive(last_used: i64, now: i64, ttl_secs: i64) -> bool {
     !(ttl_secs > 0 && now.saturating_sub(last_used) >= ttl_secs)
 }
 
 impl Runtime {
-    pub fn add_drafts(&self, schema: &str, items: &[(String, String)]) -> anyhow::Result<usize> {
+    /// 批量写入草稿（一次 `apply_batch`）。
+    ///
+    /// `ttl_secs` 回答的是「库里同 key 的那条记录还算不算存在」：
+    ///
+    /// - **不存在** → 写入，`last_used = now`；
+    /// - **已存在且未过期** → 跳过，保留首次入库时间（不续期，见模块文档）；
+    /// - **已存在但已过期** → 先删再建，等同于一条全新的草稿，重新获得一整个有效期。
+    ///   这一条不能省成「只要存在就跳过」：清理是机会性的（只跟在落库之后跑），把过期的
+    ///   旧记录当成「已存在」就是让清理时机决定语义——清理没扫到之前，那条词再也进不了草稿。
+    ///
+    /// `ttl_secs <= 0` = 永不过期，此时已存在的一律保留。
+    ///
+    /// 返回**实际落库条数**（被跳过的已存在条目不计入）。
+    pub fn add_drafts(
+        &self,
+        schema: &str,
+        items: &[(String, String)],
+        ttl_secs: i64,
+    ) -> anyhow::Result<usize> {
         if items.is_empty() {
             return Ok(0);
         }
-        let ops: Vec<Op> = items
-            .iter()
-            .map(|(c, t)| Op::new(D, schema, OpKind::Upsert, c, t, Payload::Weight(0), 0))
-            .collect();
-        self.ud.apply_batch(&ops)?;
-        Ok(items.len())
+        let now = now_secs();
+        let mut ops: Vec<Op> = Vec::with_capacity(items.len());
+        let mut added = 0usize;
+        for (c, t) in items {
+            let existed = self.ud.get(D, schema, c, t);
+            match existed {
+                Some(e) if draft_alive(e.last_used, now, ttl_secs) => continue,
+                Some(_) => {
+                    // 过期旧记录：删掉重建，让它拿到新的首次入库时间。
+                    ops.push(Op::new(D, schema, OpKind::Delete, c, t, Payload::None, 0));
+                    ops.push(Op::new(
+                        D,
+                        schema,
+                        OpKind::Upsert,
+                        c,
+                        t,
+                        Payload::Weight(0),
+                        0,
+                    ));
+                    added += 1;
+                }
+                None => {
+                    ops.push(Op::new(
+                        D,
+                        schema,
+                        OpKind::Upsert,
+                        c,
+                        t,
+                        Payload::Weight(0),
+                        0,
+                    ));
+                    added += 1;
+                }
+            }
+        }
+        if !ops.is_empty() {
+            self.ud.apply_batch(&ops)?;
+        }
+        Ok(added)
     }
 
     pub fn search_drafts(&self, schema: &str, code: &str, ttl_secs: i64) -> Vec<String> {
@@ -110,7 +172,8 @@ impl Runtime {
         Ok((deleted, kept))
     }
 
-    /// 超出 `max_keep` 则按 last_used 升序淘汰。条数上界不超限就直接返回（不扫描）。
+    /// 超出 `max_keep` 则按 `last_used` 升序淘汰（草稿上它 = 首次入库时间 ⇒ 纯 FIFO）。
+    /// 条数上界不超限就直接返回（不扫描）。
     pub fn evict_drafts(&self, schema: &str, max_keep: usize) -> anyhow::Result<usize> {
         if self.ud.upper_bound(D, schema) <= max_keep {
             return Ok(0);
